@@ -53,8 +53,8 @@ def get_benchmark_configs():
 
 
 if __name__ == "__main__":
-    for i in range(1, 2):
-        version = f"v{i}"
+    for i in range(1, 3):
+        version = f"forward_v{i}"
         svd_matmul_fn = getattr(__import__(version), "svd_weight_matmul")
         test(svd_matmul_fn)
         configs = get_benchmark_configs()
