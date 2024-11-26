@@ -1,3 +1,4 @@
+
 import torch
 import triton
 import triton.language as tl
@@ -6,13 +7,13 @@ import common
 
 def get_configs_io_bound():
     configs = []
-    for block_n in [256, 128, 64, 32]:
+    for block_n in [256, 128, 64, 32, 16]:
         for block_m in [256, 128, 64, 32]:
             for block_k in [256, 128, 64]:
                 for num_stages in [5, 4, 3]:
                     for num_warps in [4, 8]:
                         for num_ctas in [1]:
-                            if block_m * block_n * block_k >= 32 * 64 * 128 and block_m * block_n * block_k <= 128 * 128 * 128:
+                            if block_m * block_n * block_k >= 16 * 64 * 64 and block_m * block_n * block_k <= 128 * 128 * 256:
                                 configs.append(
                                     triton.Config({'block_M': block_m, 'block_N': block_n, 'block_K': block_k, 'R': 16, 'GROUP_SIZE_M': 8},
                                                     num_stages=num_stages, num_warps=num_warps, num_ctas=num_ctas))
@@ -27,17 +28,14 @@ def get_configs_io_bound():
     key=["M", "N", "K"],
 )
 @triton.jit
-def svd_weight_kernel(
+def triton_dense_forward_kernel(
     x_ptr,
-    u_ptr,
-    v_ptr,
+    w_ptr,
     c_ptr,
     stride_xm,
     stride_xk,
-    stride_uk,
-    stride_ur,
-    stride_vr,
-    stride_vn,
+    stride_wk,
+    stride_wn,
     M: int,
     N: int,
     K: int,
@@ -61,27 +59,21 @@ def svd_weight_kernel(
     # Initialize fp and int accumulators
     fp_acc = tl.zeros((block_M, block_N), dtype=tl.float32)
 
-    # Load block of V
-    v_blk = tl.load(
-        v_ptr + tl.arange(0, R)[:, None] * stride_vr + tl.arange(0, block_N)
-    )
     # R: 16 block_N: 256 block_K: 32 block_M: 64
 
     for i in range(0, K, block_K):
         # Load blocks of X, W, and U
+        w_blk = tl.load(
+            w_ptr
+            + (i + tl.arange(0, block_K))[:, None] * stride_wk
+            + tl.arange(0, block_N)
+        )
         x_blk = tl.load(
             x_ptr
             + (offs_m + tl.arange(0, block_M))[:, None] * stride_xm
             + (i + tl.arange(0, block_K))
         )
-        u_blk = tl.load(
-            u_ptr + (i + tl.arange(0, block_K))[:, None] * stride_uk + tl.arange(0, R)
-        )
-
-        # Compute X * U
-        xu_blk = tl.dot(x_blk, u_blk)
-        xu_blk2 = tl.cast(xu_blk, dtype=tl.bfloat16)
-        fp_acc = tl.dot(xu_blk2, v_blk, fp_acc)
+        fp_acc = tl.dot(x_blk, w_blk, fp_acc)
 
     tl.store(
         c_ptr + (offs_m + tl.arange(0, block_M))[:, None] * N + tl.arange(0, block_N),
@@ -89,31 +81,27 @@ def svd_weight_kernel(
     )
 
 
-def svd_weight_matmul(
-    x: torch.Tensor, u: torch.Tensor, v: torch.Tensor
+def triton_dense_forward(
+    x: torch.Tensor, w: torch.Tensor,
 ) -> torch.Tensor:
     # Allocate result tensor on the GPU
     m, k = x.shape
-    r, n = v.shape
+    _, n = w.shape
 
-    assert k == u.shape[0]
-    assert u.shape[1] == r
+    assert w.shape[0] == k
 
     c = torch.empty((m, n), dtype=x.dtype, device="cuda")
     grid = lambda opt: (triton.cdiv(m, opt["block_M"]), triton.cdiv(n, opt["block_N"]))
 
     # Launch the Triton kernel with auto-tuned configurations
-    svd_weight_kernel[grid](
+    triton_dense_forward_kernel[grid](
         x,
-        u,
-        v,
+        w,
         c,
         x.stride(0),
         x.stride(1),
-        u.stride(0),
-        u.stride(1),
-        v.stride(0),
-        v.stride(1),
+        w.stride(0),
+        w.stride(1),
         M=m,
         N=n,
         K=k,
